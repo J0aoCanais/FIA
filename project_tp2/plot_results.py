@@ -48,6 +48,20 @@ EXPERIMENTS = {
 
 COLORS = plt.cm.tab10(np.linspace(0, 0.8, 8))
 
+# ============================================================
+# Configuração das 6 combinações da Fase 2
+# ============================================================
+P2_COMBINATIONS = [
+    {'tag': 'cxUniform_mutGauss',    'label': 'CX Uniforme\n+Mut Gauss'},
+    {'tag': 'cxUniform_mutUniform',  'label': 'CX Uniforme\n+Mut Uniforme'},
+    {'tag': 'cxTwoPoint_mutGauss',   'label': 'CX 2 Pontos\n+Mut Gauss'},
+    {'tag': 'cxTwoPoint_mutUniform', 'label': 'CX 2 Pontos\n+Mut Uniforme'},
+    {'tag': 'cxArith_mutGauss',      'label': 'CX Aritmético\n+Mut Gauss'},
+    {'tag': 'cxArith_mutUniform',    'label': 'CX Aritmético\n+Mut Uniforme'},
+]
+
+COLORS_P2 = plt.cm.tab10(np.linspace(0, 1.0, 6))
+
 
 def short_label(exp_num):
     c = EXPERIMENTS[exp_num]
@@ -87,6 +101,45 @@ def load_experiment(exp_num, log_dir, n_runs=5):
 
 def load_all(log_dir, n_runs=5):
     return {e: load_experiment(e, log_dir, n_runs) for e in EXPERIMENTS}
+
+
+def load_p2_experiment(tag, log_dir, n_runs=5):
+    """Carrega os N runs de uma combinação da Fase 2. Retorna array (n_runs, n_gens) ou None."""
+    runs = []
+    for run in range(n_runs):
+        path = os.path.join(log_dir, f'log_p2_{tag}_r{run}.txt')
+        if os.path.exists(path):
+            runs.append(read_log(path))
+    if not runs:
+        return None
+    min_len = min(len(r) for r in runs)
+    return np.array([r[:min_len] for r in runs])
+
+
+def load_p2_all(log_dir, n_runs=5):
+    """Carrega os dados de todas as 6 combinações da Fase 2."""
+    return {c['tag']: load_p2_experiment(c['tag'], log_dir, n_runs)
+            for c in P2_COMBINATIONS}
+
+
+def load_p2_test_results(csv_path):
+    """
+    Lê test_results_p2.csv com colunas: tag,run,mean_fitness,success_rate
+    Devolve dict {tag: {'fitness': [...], 'success': [...]}} ou None.
+    """
+    results = {c['tag']: {'fitness': [], 'success': []} for c in P2_COMBINATIONS}
+    if not os.path.exists(csv_path):
+        return None
+    with open(csv_path, newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            tag = row['tag']
+            if tag in results:
+                results[tag]['fitness'].append(float(row['mean_fitness']))
+                results[tag]['success'].append(float(row['success_rate']))
+    if all(len(v['fitness']) == 0 for v in results.values()):
+        return None
+    return results
 
 
 # ============================================================
@@ -419,6 +472,121 @@ def fig6_summary_table(all_data, test_results, save_dir, show=False, label=''):
 
 
 # ============================================================
+# FIG P2-1 — Curvas de evolução das 6 combinações (Fase 2)
+# ============================================================
+def fig_p2_curves(p2_data, save_dir, show=False):
+    """Curvas de evolução para as 6 combinações num único plot (média ± 1σ sombreado)."""
+    fig, ax = plt.subplots(figsize=(13, 6))
+
+    for idx, comb in enumerate(P2_COMBINATIONS):
+        data = p2_data.get(comb['tag'])
+        if data is None or len(data) == 0:
+            continue
+        gens  = np.arange(data.shape[1])
+        mean  = data.mean(axis=0)
+        std   = data.std(axis=0)
+        color = COLORS_P2[idx]
+        ax.plot(gens, mean, color=color, linewidth=2.0,
+                label=comb['label'].replace('\n', ' '))
+        ax.fill_between(gens, mean - std, mean + std, color=color, alpha=0.15)
+
+    ax.set_title('Fase 2 — Evolução do Fitness: Comparação de Operadores (Com Vento)',
+                 fontsize=12, fontweight='bold')
+    ax.set_xlabel('Geração')
+    ax.set_ylabel('Fitness médio (melhor indivíduo)')
+    ax.legend(fontsize=9, loc='lower right', ncol=2, framealpha=0.9, edgecolor='gray')
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    fname = os.path.join(save_dir, 'fig_p2_curves.pdf')
+    _save_or_show(fig, fname, show)
+
+
+# ============================================================
+# FIG P2-2 — Barras: fitness médio e taxa de sucesso (Fase 2)
+# ============================================================
+def fig_p2_bars(p2_data, test_p2_results, save_dir, show=False):
+    """
+    Gráfico de barras duplo para a Fase 2.
+    Fitness: usa CSV de teste se disponível, senão a última geração do treino.
+    Taxa de sucesso: só aparece se houver CSV de teste.
+    """
+    tags       = [c['tag']   for c in P2_COMBINATIONS]
+    labels     = [c['label'] for c in P2_COMBINATIONS]
+    x          = np.arange(len(tags))
+    bar_colors = [COLORS_P2[i] for i in range(len(tags))]
+
+    # Fitness — preferir CSV de teste, fallback para última geração de treino
+    mean_fit, std_fit, fit_source = [], [], []
+    for tag in tags:
+        if test_p2_results and test_p2_results.get(tag, {}).get('fitness'):
+            vals = test_p2_results[tag]['fitness']
+            mean_fit.append(np.mean(vals))
+            std_fit.append(np.std(vals))
+            fit_source.append('teste')
+        elif p2_data.get(tag) is not None and len(p2_data[tag]) > 0:
+            last = p2_data[tag][:, -1]
+            mean_fit.append(last.mean())
+            std_fit.append(last.std())
+            fit_source.append('treino')
+        else:
+            mean_fit.append(0); std_fit.append(0); fit_source.append('—')
+
+    has_success = test_p2_results is not None and any(
+        test_p2_results.get(tag, {}).get('success') for tag in tags
+    )
+    mean_succ = [np.mean(test_p2_results[tag]['success']) * 100
+                 if has_success and test_p2_results.get(tag, {}).get('success') else 0
+                 for tag in tags]
+    std_succ  = [np.std(test_p2_results[tag]['success']) * 100
+                 if has_success and test_p2_results.get(tag, {}).get('success') else 0
+                 for tag in tags]
+
+    ncols = 2 if has_success else 1
+    fig, axes = plt.subplots(1, ncols, figsize=(7 * ncols, 6))
+    if ncols == 1:
+        axes = [axes]
+
+    # Painel esquerdo: Fitness
+    ax_fit = axes[0]
+    bars = ax_fit.bar(x, mean_fit, yerr=std_fit, capsize=5,
+                      color=bar_colors, edgecolor='black', linewidth=0.7, alpha=0.88)
+    ax_fit.set_xticks(x)
+    ax_fit.set_xticklabels(labels, fontsize=8)
+    ax_fit.set_ylabel('Fitness Médio')
+    src_note = 'última geração — treino' if fit_source[0] == 'treino' else 'episódios de teste'
+    ax_fit.set_title(f'Fitness Médio por Combinação\n({src_note}, ±σ)', fontweight='bold')
+    ax_fit.grid(axis='y', alpha=0.3)
+    for bar, val in zip(bars, mean_fit):
+        ax_fit.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.5,
+                    f'{val:.1f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+    # Painel direito: Taxa de sucesso (só se disponível)
+    if has_success:
+        ax_suc = axes[1]
+        bars2 = ax_suc.bar(x, mean_succ, yerr=std_succ, capsize=5,
+                           color=bar_colors, edgecolor='black', linewidth=0.7, alpha=0.88)
+        ax_suc.set_xticks(x)
+        ax_suc.set_xticklabels(labels, fontsize=8)
+        ax_suc.set_ylabel('Taxa de Sucesso (%)')
+        ax_suc.set_ylim(0, 110)
+        ax_suc.set_title('Taxa de Sucesso por Combinação\n(±σ)', fontweight='bold')
+        ax_suc.grid(axis='y', alpha=0.3)
+        for bar, val, std in zip(bars2, mean_succ, std_succ):
+            ax_suc.text(bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + std + 1,
+                        f'{val:.1f}%', ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+    fig.suptitle('Fase 2 — Comparação de Operadores Genéticos (Com Vento)',
+                 fontsize=12, fontweight='bold')
+    fig.tight_layout()
+
+    fname = os.path.join(save_dir, 'fig_p2_bars.pdf')
+    _save_or_show(fig, fname, show)
+
+
+# ============================================================
 # Tabela resumo no terminal
 # ============================================================
 def print_terminal_table(all_data, test_results=None, label=''):
@@ -464,14 +632,17 @@ def _save_or_show(fig, fname, show):
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dir1',  default='../resultados/',  help='Logs sem vento')
-    parser.add_argument('--dir2',  default='../resultados2/', help='Logs com vento')
-    parser.add_argument('--out',   default='../graficos/',    help='Pasta de saída')
-    parser.add_argument('--runs',  type=int, default=5)
-    parser.add_argument('--show',  action='store_true')
-    parser.add_argument('--no-wind', action='store_true', help='Ignora resultados2/')
-    parser.add_argument('--csv1',  default=None, help='test_results CSV sem vento')
-    parser.add_argument('--csv2',  default=None, help='test_results CSV com vento')
+    parser.add_argument('--dir1',   default='../resultados/',    help='Logs Fase 1 sem vento')
+    parser.add_argument('--dir2',   default='../resultados2/',   help='Logs Fase 1 com vento')
+    parser.add_argument('--dir-p2', default='../resultados_p2/', help='Logs Fase 2 (operadores)')
+    parser.add_argument('--out',    default='../graficos/',       help='Pasta de saída')
+    parser.add_argument('--runs',   type=int, default=5)
+    parser.add_argument('--show',   action='store_true')
+    parser.add_argument('--no-wind',  action='store_true', help='Ignora resultados2/')
+    parser.add_argument('--no-phase2', action='store_true', help='Ignora Fase 2')
+    parser.add_argument('--csv1',   default=None, help='test_results CSV Fase 1 sem vento')
+    parser.add_argument('--csv2',   default=None, help='test_results CSV Fase 1 com vento')
+    parser.add_argument('--csv-p2', default=None, help='test_results_p2.csv da Fase 2')
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -512,6 +683,27 @@ def main():
     if data_no_wind and data_wind:
         print('A gerar comparação sem vento vs com vento...')
         fig5_wind_comparison(data_no_wind, data_wind, args.out, args.show)
+
+    # --- Fase 2: comparação de operadores ---
+    if not args.no_phase2:
+        dir_p2 = args.dir_p2
+        if os.path.isdir(dir_p2):
+            print(f'\nA ler logs Fase 2: {os.path.abspath(dir_p2)}')
+            p2_data = load_p2_all(dir_p2, args.runs)
+
+            csv_p2 = args.csv_p2 or os.path.join(dir_p2, 'test_results_p2.csv')
+            test_p2 = load_p2_test_results(csv_p2)
+
+            has_any = any(v is not None for v in p2_data.values())
+            if has_any:
+                print('A gerar gráficos Fase 2...')
+                fig_p2_curves(p2_data, args.out, args.show)
+                fig_p2_bars(p2_data, test_p2, args.out, args.show)
+            else:
+                print(f'  [fase2] Nenhum log encontrado em {dir_p2} — a saltar.')
+        else:
+            print(f'\n  [fase2] Pasta não encontrada ({dir_p2}) — a saltar.')
+            print('          Use --dir-p2 <pasta> para indicar onde estão os logs.')
 
     print('\nConcluído.')
     print(f'Gráficos em: {os.path.abspath(args.out)}')

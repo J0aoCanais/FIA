@@ -199,6 +199,38 @@ def mutation(p):
     return ind
 
 
+def crossover_two_point(p1, p2):
+    """Crossover de dois pontos: p1 | p2 | p1."""
+    size = len(p1['genotype'])
+    c1, c2 = sorted(random.sample(range(size + 1), 2))
+    genotype = (
+        p1['genotype'][:c1] +
+        p2['genotype'][c1:c2] +
+        p1['genotype'][c2:]
+    )
+    return {'genotype': genotype, 'fitness': None}
+
+
+def crossover_arithmetic(p1, p2):
+    """Crossover aritmético: filho[i] = alfa*p1[i] + (1-alfa)*p2[i]."""
+    alfa = random.random()
+    genotype = [
+        alfa * p1['genotype'][i] + (1 - alfa) * p2['genotype'][i]
+        for i in range(len(p1['genotype']))
+    ]
+    return {'genotype': genotype, 'fitness': None}
+
+
+def mutation_uniform(p):
+    """Mutação uniforme: perturbação em [-0.2, 0.2] com probabilidade PROB_MUTATION por gene."""
+    ind = copy.deepcopy(p)
+    for i in range(len(ind['genotype'])):
+        if random.random() < PROB_MUTATION:
+            ind['genotype'][i] += random.uniform(-0.2, 0.2)
+    ind['fitness'] = None
+    return ind
+
+
 def survival_selection(population, offspring):
     """
     Selecção de sobreviventes com elitismo.
@@ -262,6 +294,54 @@ def evolution():
 
 
 # ============================================================
+# Ciclo evolutivo parametrizado (Fase 2)
+# ============================================================
+def evolution_p2(cx_fn, mut_fn):
+    """
+    Variante de evolution() que aceita operadores de crossover e mutação
+    como argumentos. Usa os parâmetros globais PROB_CROSSOVER, PROB_MUTATION,
+    ELITE_SIZE, POPULATION_SIZE e NUMBER_OF_GENERATIONS sem os alterar.
+    """
+    evaluation_processes = []
+    for _ in range(NUM_PROCESSES):
+        p = Process(target=evaluate, args=(evaluationQueue, evaluatedQueue))
+        p.start()
+        evaluation_processes.append(p)
+
+    population = list(generate_initial_population())
+    population = evaluate_population(population)
+    population.sort(key=lambda x: x['fitness'], reverse=True)
+
+    bests = [(population[0]['genotype'], population[0]['fitness'])]
+
+    for gen in range(NUMBER_OF_GENERATIONS):
+        offspring = []
+        while len(offspring) < POPULATION_SIZE:
+            if random.random() < PROB_CROSSOVER:
+                p1 = parent_selection(population)
+                p2 = parent_selection(population)
+                ni = cx_fn(p1, p2)
+            else:
+                ni = parent_selection(population)
+            ni = mut_fn(ni)
+            offspring.append(ni)
+
+        offspring = evaluate_population(offspring)
+        population = survival_selection(population, offspring)
+
+        best = (population[0]['genotype'], population[0]['fitness'])
+        bests.append(best)
+        print(f'  Gen {gen:3d}: {best[1]:.2f}')
+
+    for _ in range(NUM_PROCESSES):
+        evaluationQueue.put(None)
+    for p in evaluation_processes:
+        p.join()
+
+    return bests
+
+
+# ============================================================
 # Carregar logs
 # ============================================================
 def load_bests(fname):
@@ -280,11 +360,14 @@ def load_bests(fname):
 if __name__ == '__main__':
 
     # ---- ESCOLHER MODO ----
-    # 'evolve'   : correr as 8 experiências (Tabela 2)
-    # 'test'     : testar um indivíduo específico (sem visualização)
-    # 'test_all' : testa o melhor indivíduo de cada log e gera test_results.csv
-    # 'view'     : visualizar indivíduo evoluído com janela
-    MODE = 'evolve'
+    # Pode ser passado como argumento: python3 script.py evolve_phase2
+    # 'evolve'        : correr as 8 experiências (Tabela 2)
+    # 'evolve_phase2' : comparação de 6 operadores (Fase 2)
+    # 'test'          : testar um indivíduo específico (sem visualização)
+    # 'test_all'      : testa o melhor indivíduo de cada log e gera test_results.csv
+    # 'view'          : visualizar indivíduo evoluído com janela
+    import sys
+    MODE = sys.argv[1] if len(sys.argv) > 1 else 'evolve'
 
     # ================================================================
     # MODO EVOLVE — executa as 8 experiências da Tabela 2
@@ -302,6 +385,9 @@ if __name__ == '__main__':
             {'mut': 0.008, 'cx': 0.9, 'elite': 1},  # Experiência 7
             {'mut': 0.05,  'cx': 0.9, 'elite': 1},  # Experiência 8
         ]
+
+        LOG_DIR = './resultados/'
+        os.makedirs(LOG_DIR, exist_ok=True)
 
         N_RUNS = 5
         # 40 seeds (8 experiências × 5 runs) para reprodutibilidade
@@ -342,7 +428,7 @@ if __name__ == '__main__':
                 print(f'\n  --- Run {run + 1}/{N_RUNS} (seed={seed}) ---')
                 bests = evolution()
 
-                fname = f'log_e{exp_num}_r{run}.txt'
+                fname = os.path.join(LOG_DIR, f'log_e{exp_num}_r{run}.txt')
                 with open(fname, 'w') as f:
                     for b in bests:
                         f.write(f'{b[1]}\t{SHAPE}\t{b[0]}\n')
@@ -436,6 +522,97 @@ if __name__ == '__main__':
             writer.writeheader()
             writer.writerows(rows)
         print(f'\nResultados guardados em: {OUT_CSV}')
+
+    # ================================================================
+    # MODO EVOLVE_PHASE2 — Fase 2: comparação de 6 combinações de operadores
+    # ================================================================
+    elif MODE == 'evolve_phase2':
+
+        # ---- Configuração Vencedora da Fase 1 (atualizar após análise) ----
+        PROB_MUTATION  = 0.008   # melhor valor encontrado na Fase 1
+        PROB_CROSSOVER = 0.9     # melhor valor encontrado na Fase 1
+        ELITE_SIZE     = 1       # melhor valor encontrado na Fase 1
+
+        ENABLE_WIND   = True     # Fase 2 corre sempre com vento
+
+        P2_COMBINATIONS = [
+            {
+                'tag':    'cxUniform_mutGauss',
+                'label':  'CX Uniforme + Mut Gaussiana',
+                'cx_fn':  crossover,
+                'mut_fn': mutation,
+            },
+            {
+                'tag':    'cxUniform_mutUniform',
+                'label':  'CX Uniforme + Mut Uniforme',
+                'cx_fn':  crossover,
+                'mut_fn': mutation_uniform,
+            },
+            {
+                'tag':    'cxTwoPoint_mutGauss',
+                'label':  'CX 2 Pontos + Mut Gaussiana',
+                'cx_fn':  crossover_two_point,
+                'mut_fn': mutation,
+            },
+            {
+                'tag':    'cxTwoPoint_mutUniform',
+                'label':  'CX 2 Pontos + Mut Uniforme',
+                'cx_fn':  crossover_two_point,
+                'mut_fn': mutation_uniform,
+            },
+            {
+                'tag':    'cxArith_mutGauss',
+                'label':  'CX Aritmético + Mut Gaussiana',
+                'cx_fn':  crossover_arithmetic,
+                'mut_fn': mutation,
+            },
+            {
+                'tag':    'cxArith_mutUniform',
+                'label':  'CX Aritmético + Mut Uniforme',
+                'cx_fn':  crossover_arithmetic,
+                'mut_fn': mutation_uniform,
+            },
+        ]
+
+        LOG_DIR = './resultados_p2/'
+        os.makedirs(LOG_DIR, exist_ok=True)
+
+        N_RUNS = 5
+        # 30 seeds fixas (6 combinações × 5 runs) para reprodutibilidade
+        SEEDS_P2 = [
+            111, 222, 333, 444, 555,   # cxUniform_mutGauss
+            161, 272, 383, 494, 515,   # cxUniform_mutUniform
+            121, 232, 343, 454, 565,   # cxTwoPoint_mutGauss
+            171, 282, 393, 414, 525,   # cxTwoPoint_mutUniform
+            131, 242, 353, 464, 575,   # cxArith_mutGauss
+            181, 292, 313, 424, 535,   # cxArith_mutUniform
+        ]
+
+        print(f'\n{"="*60}')
+        print(f'FASE 2 — Comparação de Operadores Genéticos (Com Vento)')
+        print(f'Configuração vencedora: mut={PROB_MUTATION}, '
+              f'cx={PROB_CROSSOVER}, elite={ELITE_SIZE}')
+        print(f'{"="*60}')
+
+        for comb_idx, comb in enumerate(P2_COMBINATIONS):
+            print(f'\n{"="*60}')
+            print(f'Combinação {comb_idx + 1}/{len(P2_COMBINATIONS)}: {comb["label"]}')
+            print(f'{"="*60}')
+
+            for run in range(N_RUNS):
+                seed = SEEDS_P2[comb_idx * N_RUNS + run]
+                random.seed(seed)
+                np.random.seed(seed)
+
+                print(f'\n  --- Run {run + 1}/{N_RUNS} (seed={seed}) ---')
+                bests = evolution_p2(comb['cx_fn'], comb['mut_fn'])
+
+                fname = os.path.join(LOG_DIR, f'log_p2_{comb["tag"]}_r{run}.txt')
+                with open(fname, 'w') as f:
+                    for b in bests:
+                        f.write(f'{b[1]}\t{SHAPE}\t{b[0]}\n')
+
+                print(f'  Saved {fname}  |  best fitness = {bests[-1][1]:.2f}')
 
     # ================================================================
     # MODO VIEW — visualiza o indivíduo numa janela
