@@ -6,40 +6,40 @@ import os
 from multiprocessing import Process, Queue
 
 # ============================================================
-# CONFIG — alterar estes valores para mudar o comportamento
+# CONFIG — parâmetros físicos e estruturais (não alterar)
 # ============================================================
-ENABLE_WIND = True
-WIND_POWER = 15.0
+ENABLE_WIND      = True
+WIND_POWER       = 15.0
 TURBULENCE_POWER = 0.0
-GRAVITY = -10.0
-RENDER_MODE = 'human'
-TEST_EPISODES = 100     # episódios para avaliação final (1000 para relatório)
-STEPS = 500
+GRAVITY          = -10.0
+RENDER_MODE      = 'human'
+STEPS            = 500
 
-NUM_PROCESSES = os.cpu_count()
+NUM_PROCESSES   = os.cpu_count()
 evaluationQueue = Queue()
-evaluatedQueue = Queue()
+evaluatedQueue  = Queue()
 
-nInputs = 8
+nInputs  = 8
 nOutputs = 2
-SHAPE = (nInputs, 12, nOutputs)
+SHAPE    = (nInputs, 12, nOutputs)
 
 GENOTYPE_SIZE = 0
 for i in range(1, len(SHAPE)):
     GENOTYPE_SIZE += SHAPE[i - 1] * SHAPE[i]   # 8*12 + 12*2 = 120
 
 POPULATION_SIZE = 100
-NUMBER_OF_GENERATIONS = 100
 
-# Estes três parâmetros são sobrepostos pelo ciclo de experiências em __main__
-PROB_CROSSOVER = 0.9
-PROB_MUTATION  = 0.008   # ≈ 1/GENOTYPE_SIZE
-STD_DEV        = 0.1
-ELITE_SIZE     = 1
+# Hiperparâmetros de treino — sobrepostos em __main__
+NUMBER_OF_GENERATIONS = 150
+PROB_CROSSOVER        = 0.9
+PROB_MUTATION         = 0.05
+STD_DEV               = 0.1
+ELITE_SIZE            = 2
+TOURNAMENT_SIZE       = 5
 
 
 # ============================================================
-# Rede neuronal
+# REDE NEURONAL
 # ============================================================
 def network(shape, observation, ind):
     """Calcula a acção da rede neuronal dado o genótipo e a observação."""
@@ -54,15 +54,15 @@ def network(shape, observation, ind):
 
 
 # ============================================================
-# Simulação e função objectivo
+# FUNÇÃO OBJECTIVO
 # ============================================================
 def check_successful_landing(observation):
     """Verifica se a aterragem foi bem-sucedida segundo os critérios do enunciado."""
-    x              = observation[0]
-    vy             = observation[3]
-    theta          = observation[4]
-    contact_left   = observation[6]
-    contact_right  = observation[7]
+    x            = observation[0]
+    vy           = observation[3]
+    theta        = observation[4]
+    contact_left = observation[6]
+    contact_right= observation[7]
 
     legs_touching      = contact_left == 1 and contact_right == 1
     on_landing_pad     = abs(x) <= 0.2
@@ -74,9 +74,9 @@ def check_successful_landing(observation):
 
 def objective_function(observation):
     """
-    Função objectivo com gradiente suave — avalia a última observação antes do impacto.
+    Fase 1/2 — gradiente suave.
     Penaliza distância ao pad, velocidade e ângulo de forma contínua.
-    Bónus de estabilidade quando ambas as pernas tocam. Sucesso vale +50 (sem cliff).
+    Bónus de estabilidade quando ambas as pernas tocam. Sucesso vale +50.
     Retorna (fitness, sucesso_bool).
     """
     x, y, vx, vy, theta, v_theta, contact_left, contact_right = observation
@@ -104,8 +104,43 @@ def objective_function(observation):
     return fitness, check_successful_landing(observation)
 
 
+def objective_function_v2(observation):
+    """
+    Fase 3 — reward shaping extremo.
+    Penalidades quadráticas no ângulo e velocidade.
+    Bónus exponenciais massivos para aterragem suave com as duas pernas.
+    Sucesso vale +100. Retorna (fitness, sucesso_bool).
+    """
+    x, y, vx, vy, theta, v_theta, contact_left, contact_right = observation
+
+    distance_to_pad    = np.sqrt(x**2 + y**2)
+    velocity_magnitude = np.sqrt(vx**2 + vy**2)
+
+    distance_reward  = -5.0 * distance_to_pad
+    velocity_penalty = -3.0 * (vx**2 + vy**2)
+    angle_penalty    = -5.0 * theta**2 - 2.0 * v_theta**2
+
+    leg_bonus = (10 if contact_left == 1 else 0) + (10 if contact_right == 1 else 0)
+
+    landing_bonus = 0
+    if contact_left == 1 and contact_right == 1:
+        landing_bonus += 100 * np.exp(-3.0 * velocity_magnitude)
+        landing_bonus += 100 * np.exp(-5.0 * abs(theta))
+        landing_bonus +=  50 * np.exp(-abs(x) / 0.15)
+
+    fitness = distance_reward + velocity_penalty + angle_penalty + leg_bonus + landing_bonus
+
+    if check_successful_landing(observation):
+        fitness += 100
+
+    return fitness, check_successful_landing(observation)
+
+
+# ============================================================
+# SIMULAÇÃO
+# ============================================================
 def simulate(genotype, render_mode=None, seed=None, env=None):
-    """Simula um episódio do Lunar Lander e avalia o indivíduo."""
+    """Fase 1/2 — simula um episódio e avalia com objective_function."""
     env_was_none = env is None
     if env is None:
         env = gym.make(
@@ -127,15 +162,40 @@ def simulate(genotype, render_mode=None, seed=None, env=None):
     if env_was_none:
         env.close()
 
-    # Avalia a última observação antes do impacto/paragem
     return objective_function(prev_observation)
 
 
+def simulate_v2(genotype, render_mode=None, seed=None, env=None):
+    """Fase 3 — simula um episódio e avalia com objective_function_v2."""
+    env_was_none = env is None
+    if env is None:
+        env = gym.make(
+            "LunarLander-v3", render_mode=render_mode,
+            continuous=True, gravity=GRAVITY,
+            enable_wind=ENABLE_WIND, wind_power=WIND_POWER,
+            turbulence_power=TURBULENCE_POWER
+        )
+
+    observation, info = env.reset(seed=seed)
+
+    for _ in range(STEPS):
+        prev_observation = observation
+        action = network(SHAPE, observation, genotype)
+        observation, reward, terminated, truncated, info = env.step(action)
+        if terminated or truncated:
+            break
+
+    if env_was_none:
+        env.close()
+
+    return objective_function_v2(prev_observation)
+
+
 # ============================================================
-# Avaliação paralela
+# AVALIAÇÃO PARALELA
 # ============================================================
 def evaluate(evaluationQueue, evaluatedQueue):
-    """Worker: avalia indivíduos até receber None."""
+    """Worker Fase 1/2: usa simulate (objective_function)."""
     env = gym.make(
         "LunarLander-v3", render_mode=None,
         continuous=True, gravity=GRAVITY,
@@ -151,8 +211,25 @@ def evaluate(evaluationQueue, evaluatedQueue):
     env.close()
 
 
+def evaluate_v2(evaluationQueue, evaluatedQueue):
+    """Worker Fase 3: usa simulate_v2 (objective_function_v2)."""
+    env = gym.make(
+        "LunarLander-v3", render_mode=None,
+        continuous=True, gravity=GRAVITY,
+        enable_wind=ENABLE_WIND, wind_power=WIND_POWER,
+        turbulence_power=TURBULENCE_POWER
+    )
+    while True:
+        ind = evaluationQueue.get()
+        if ind is None:
+            break
+        ind['fitness'] = simulate_v2(ind['genotype'], seed=None, env=env)[0]
+        evaluatedQueue.put(ind)
+    env.close()
+
+
 def evaluate_population(population):
-    """Avalia uma lista de indivíduos usando múltiplos processos."""
+    """Avalia uma lista de indivíduos usando os workers activos."""
     for ind in population:
         evaluationQueue.put(ind)
     new_pop = []
@@ -162,7 +239,7 @@ def evaluate_population(population):
 
 
 # ============================================================
-# Operadores genéticos
+# GESTÃO DA POPULAÇÃO
 # ============================================================
 def generate_initial_population():
     """Gera a população inicial com genótipos uniformes em [-1, 1]."""
@@ -173,15 +250,35 @@ def generate_initial_population():
     return population
 
 
+def survival_selection(population, offspring):
+    """
+    Selecção de sobreviventes com elitismo.
+    Os ELITE_SIZE melhores da população anterior são reavaliados e preservados.
+    ELITE_SIZE=0 equivale a substituição completa pela descendência.
+    """
+    offspring.sort(key=lambda x: x['fitness'], reverse=True)
+    elite = evaluate_population(population[:ELITE_SIZE])
+    new_population = elite + offspring[ELITE_SIZE:]
+    new_population.sort(key=lambda x: x['fitness'], reverse=True)
+    return new_population
+
+
+# ============================================================
+# SELECÇÃO DE PAIS
+# ============================================================
 def parent_selection(population):
-    """Selecção por torneio (tamanho 3) — selecciona o melhor dos 3 sorteados."""
-    tournament = random.sample(population, 3)
+    """Selecção por torneio — selecciona o melhor dos TOURNAMENT_SIZE sorteados."""
+    k = globals().get('TOURNAMENT_SIZE', 3)
+    tournament = random.sample(population, k)
     winner = max(tournament, key=lambda ind: ind['fitness'])
     return copy.deepcopy(winner)
 
 
+# ============================================================
+# CROSSOVER
+# ============================================================
 def crossover(p1, p2):
-    """Crossover uniforme: cada gene herdado de p1 ou p2 com probabilidade 0.5."""
+    """Fase 1 — crossover uniforme: cada gene herdado de p1 ou p2 com prob. 0.5."""
     genotype = [
         p1['genotype'][i] if random.random() < 0.5 else p2['genotype'][i]
         for i in range(len(p1['genotype']))
@@ -189,18 +286,8 @@ def crossover(p1, p2):
     return {'genotype': genotype, 'fitness': None}
 
 
-def mutation(p):
-    """Mutação gaussiana: cada gene perturbado com probabilidade PROB_MUTATION."""
-    ind = copy.deepcopy(p)
-    for i in range(len(ind['genotype'])):
-        if random.random() < PROB_MUTATION:
-            ind['genotype'][i] += random.gauss(0, STD_DEV)
-    ind['fitness'] = None
-    return ind
-
-
 def crossover_two_point(p1, p2):
-    """Crossover de dois pontos: p1 | p2 | p1."""
+    """Fase 2 — crossover de dois pontos: p1 | p2 | p1."""
     size = len(p1['genotype'])
     c1, c2 = sorted(random.sample(range(size + 1), 2))
     genotype = (
@@ -212,7 +299,7 @@ def crossover_two_point(p1, p2):
 
 
 def crossover_arithmetic(p1, p2):
-    """Crossover aritmético: filho[i] = alfa*p1[i] + (1-alfa)*p2[i]."""
+    """Fase 2 — crossover aritmético: filho[i] = alfa*p1[i] + (1-alfa)*p2[i]."""
     alfa = random.random()
     genotype = [
         alfa * p1['genotype'][i] + (1 - alfa) * p2['genotype'][i]
@@ -221,8 +308,61 @@ def crossover_arithmetic(p1, p2):
     return {'genotype': genotype, 'fitness': None}
 
 
+def crossover_adaptive(p1, p2):
+    """
+    Fase 3 — crossover adaptativo baseado no fitness dos pais.
+    - Ambos >= 119 : BLX-alpha (alpha=0.01), explotação fina.
+    - Um >= 100, outro < 100 : aritmético ponderado 90%/10%.
+    - Caso contrário : uniforme 50/50 para exploração.
+    offspring['fitness'] = None garante reavaliação no simulador.
+    """
+    f1 = p1['fitness'] if p1['fitness'] is not None else 0
+    f2 = p2['fitness'] if p2['fitness'] is not None else 0
+    size = len(p1['genotype'])
+
+    if f1 >= 119 and f2 >= 119:
+        alpha = 0.01
+        genotype = []
+        for i in range(size):
+            g1, g2 = p1['genotype'][i], p2['genotype'][i]
+            lo = min(g1, g2)
+            hi = max(g1, g2)
+            spread = (hi - lo) * alpha
+            genotype.append(random.uniform(lo - spread, hi + spread))
+
+    elif (f1 >= 100) != (f2 >= 100):
+        good = p1 if f1 >= 100 else p2
+        bad  = p2 if f1 >= 100 else p1
+        genotype = [
+            0.9 * good['genotype'][i] + 0.1 * bad['genotype'][i]
+            for i in range(size)
+        ]
+
+    else:
+        genotype = [
+            p1['genotype'][i] if random.random() < 0.5 else p2['genotype'][i]
+            for i in range(size)
+        ]
+
+    offspring = {'genotype': genotype, 'fitness': None}
+    return offspring
+
+
+# ============================================================
+# MUTAÇÃO
+# ============================================================
+def mutation(p):
+    """Fase 1 — mutação gaussiana: perturbação += gauss(0, STD_DEV) por gene."""
+    ind = copy.deepcopy(p)
+    for i in range(len(ind['genotype'])):
+        if random.random() < PROB_MUTATION:
+            ind['genotype'][i] += random.gauss(0, STD_DEV)
+    ind['fitness'] = None
+    return ind
+
+
 def mutation_uniform(p):
-    """Mutação uniforme: perturbação em [-0.2, 0.2] com probabilidade PROB_MUTATION por gene."""
+    """Fase 2 — mutação uniforme: perturbação += uniform(-0.2, 0.2) por gene."""
     ind = copy.deepcopy(p)
     for i in range(len(ind['genotype'])):
         if random.random() < PROB_MUTATION:
@@ -231,25 +371,34 @@ def mutation_uniform(p):
     return ind
 
 
-def survival_selection(population, offspring):
+def mutation_adaptive(p):
     """
-    Selecção de sobreviventes com elitismo.
-    Os ELITE_SIZE melhores da população anterior são reavaliados e preservados.
-    Quando ELITE_SIZE=0 equivale a substituição completa pela descendência.
+    Fase 3 — mutação com intensidade adaptada ao fitness do indivíduo.
+    - fitness None ou < 100 : perturbação forte  (+= uniform(-1.5, 1.5))
+    - fitness em [100, 118[ : perturbação média  (+= gauss(0, 0.3))
+    - fitness >= 118        : micro-ajustes finos (+= gauss(0, 0.05))
+    Usa sempre += para preservar a herança genética do crossover.
     """
-    offspring.sort(key=lambda x: x['fitness'], reverse=True)
-    elite = evaluate_population(population[:ELITE_SIZE])
-    new_population = elite + offspring[ELITE_SIZE:]
-    new_population.sort(key=lambda x: x['fitness'], reverse=True)
-    return new_population
+    ind = copy.deepcopy(p)
+    fitness = ind.get('fitness', None)
+    for i in range(len(ind['genotype'])):
+        if random.random() < PROB_MUTATION:
+            if fitness is None or fitness < 100:
+                ind['genotype'][i] += random.uniform(-1.5, 1.5)
+            elif fitness < 118:
+                ind['genotype'][i] += random.gauss(0, 0.3)
+            else:
+                ind['genotype'][i] += random.gauss(0, 0.05)
+    ind['fitness'] = None
+    return ind
 
 
 # ============================================================
-# Ciclo evolutivo
+# CICLO EVOLUTIVO
 # ============================================================
 def evolution():
     """
-    Executa o algoritmo evolucionário.
+    Fase 1 — algoritmo base com crossover uniforme e mutação gaussiana.
     Usa os parâmetros globais: PROB_MUTATION, PROB_CROSSOVER, ELITE_SIZE,
     POPULATION_SIZE, NUMBER_OF_GENERATIONS.
     Retorna lista de (genótipo, fitness) do melhor por geração.
@@ -293,14 +442,11 @@ def evolution():
     return bests
 
 
-# ============================================================
-# Ciclo evolutivo parametrizado (Fase 2)
-# ============================================================
 def evolution_p2(cx_fn, mut_fn):
     """
-    Variante de evolution() que aceita operadores de crossover e mutação
-    como argumentos. Usa os parâmetros globais PROB_CROSSOVER, PROB_MUTATION,
-    ELITE_SIZE, POPULATION_SIZE e NUMBER_OF_GENERATIONS sem os alterar.
+    Fase 2 — aceita operadores de crossover e mutação como argumentos.
+    Usa os parâmetros globais sem os alterar.
+    Retorna lista de (genótipo, fitness) do melhor por geração.
     """
     evaluation_processes = []
     for _ in range(NUM_PROCESSES):
@@ -341,8 +487,53 @@ def evolution_p2(cx_fn, mut_fn):
     return bests
 
 
+def evolution_p3(cx_fn, mut_fn):
+    """
+    Fase 3 — idêntico a evolution_p2 mas os workers usam simulate_v2
+    (evaluate_v2), aplicando objective_function_v2 em cada avaliação.
+    Retorna lista de (genótipo, fitness) do melhor por geração.
+    """
+    evaluation_processes = []
+    for _ in range(NUM_PROCESSES):
+        p = Process(target=evaluate_v2, args=(evaluationQueue, evaluatedQueue))
+        p.start()
+        evaluation_processes.append(p)
+
+    population = list(generate_initial_population())
+    population = evaluate_population(population)
+    population.sort(key=lambda x: x['fitness'], reverse=True)
+
+    bests = [(population[0]['genotype'], population[0]['fitness'])]
+
+    for gen in range(NUMBER_OF_GENERATIONS):
+        offspring = []
+        while len(offspring) < POPULATION_SIZE:
+            if random.random() < PROB_CROSSOVER:
+                p1 = parent_selection(population)
+                p2 = parent_selection(population)
+                ni = cx_fn(p1, p2)
+            else:
+                ni = parent_selection(population)
+            ni = mut_fn(ni)
+            offspring.append(ni)
+
+        offspring = evaluate_population(offspring)
+        population = survival_selection(population, offspring)
+
+        best = (population[0]['genotype'], population[0]['fitness'])
+        bests.append(best)
+        print(f'  Gen {gen:3d}: {best[1]:.2f}')
+
+    for _ in range(NUM_PROCESSES):
+        evaluationQueue.put(None)
+    for p in evaluation_processes:
+        p.join()
+
+    return bests
+
+
 # ============================================================
-# Carregar logs
+# UTILITÁRIOS
 # ============================================================
 def load_bests(fname):
     """Carrega o ficheiro de log e retorna lista de (fitness, shape, genótipo)."""
@@ -355,276 +546,40 @@ def load_bests(fname):
 
 
 # ============================================================
-# Ponto de entrada
+# PONTO DE ENTRADA — Produto Final
 # ============================================================
 if __name__ == '__main__':
 
-    # ---- ESCOLHER MODO ----
-    # Pode ser passado como argumento: python3 script.py evolve_phase2
-    # 'evolve'        : correr as 8 experiências (Tabela 2)
-    # 'evolve_phase2' : comparação de 6 operadores (Fase 2)
-    # 'test'          : testar um indivíduo específico (sem visualização)
-    # 'test_all'      : testa o melhor indivíduo de cada log e gera test_results.csv
-    # 'view'          : visualizar indivíduo evoluído com janela
-    import sys
-    MODE = sys.argv[1] if len(sys.argv) > 1 else 'evolve'
+    # --- Passo A: Hiperparâmetros finais optimizados ---
+    ENABLE_WIND           = True
+    PROB_MUTATION         = 0.05
+    PROB_CROSSOVER        = 0.9
+    ELITE_SIZE            = 2
+    TOURNAMENT_SIZE       = 5
+    NUMBER_OF_GENERATIONS = 150
 
-    # ================================================================
-    # MODO EVOLVE — executa as 8 experiências da Tabela 2
-    # ================================================================
-    if MODE == 'evolve':
+    # --- Passo B: Treino com os melhores operadores (Fase 3) ---
+    print('A iniciar o treino do modelo otimizado (Fase 3)...')
+    print(f'  Config: mut={PROB_MUTATION}, cx={PROB_CROSSOVER}, '
+          f'elite={ELITE_SIZE}, torneio={TOURNAMENT_SIZE}, '
+          f'gerações={NUMBER_OF_GENERATIONS}')
+    bests = evolution_p3(crossover_adaptive, mutation_adaptive)
 
-        # Tabela 2 do enunciado: (mutação, crossover, elitismo)
-        EXPERIMENTS = [
-            {'mut': 0.008, 'cx': 0.5, 'elite': 0},  # Experiência 1
-            {'mut': 0.05,  'cx': 0.5, 'elite': 0},  # Experiência 2
-            {'mut': 0.008, 'cx': 0.9, 'elite': 0},  # Experiência 3
-            {'mut': 0.05,  'cx': 0.9, 'elite': 0},  # Experiência 4
-            {'mut': 0.008, 'cx': 0.5, 'elite': 1},  # Experiência 5
-            {'mut': 0.05,  'cx': 0.5, 'elite': 1},  # Experiência 6
-            {'mut': 0.008, 'cx': 0.9, 'elite': 1},  # Experiência 7
-            {'mut': 0.05,  'cx': 0.9, 'elite': 1},  # Experiência 8
-        ]
+    # --- Passo C: Extracção do melhor genótipo ---
+    best_genotype = bests[-1][0]
+    best_fitness  = bests[-1][1]
+    print(f'\nTreino concluído! Melhor fitness de treino: {best_fitness:.4f}')
+    print('A avaliar o melhor agente em 1000 episódios...')
 
-        LOG_DIR = './resultados/'
-        os.makedirs(LOG_DIR, exist_ok=True)
+    # --- Passo D: Avaliação final e apresentação dos resultados ---
+    N_TEST = 1000
+    total_fit, total_success = 0.0, 0
+    for _ in range(N_TEST):
+        f, s = simulate(best_genotype, render_mode=None, seed=None)
+        total_fit     += f
+        total_success += int(s)
 
-        N_RUNS = 5
-        # 40 seeds (8 experiências × 5 runs) para reprodutibilidade
-        SEEDS = [
-            964, 952, 364, 913, 140,   # Exp 1
-            726, 112, 631, 881, 844,   # Exp 2
-            965, 672, 335, 611, 457,   # Exp 3
-            591, 551, 538, 673, 437,   # Exp 4
-            513, 893, 709, 489, 788,   # Exp 5
-            709, 751, 467, 596, 976,   # Exp 6
-            101, 202, 303, 404, 505,   # Exp 7
-            606, 707, 808, 909, 110,   # Exp 8
-        ]
-
-        # Para correr apenas experiências específicas, alterar este range
-        # Ex: range(0, 1) corre só a Experiência 1
-        EXP_RANGE = range(len(EXPERIMENTS))
-
-        for exp_idx in EXP_RANGE:
-            config  = EXPERIMENTS[exp_idx]
-            exp_num = exp_idx + 1
-
-            # Atualiza os parâmetros globais usados pelos operadores
-            PROB_MUTATION  = config['mut']
-            PROB_CROSSOVER = config['cx']
-            ELITE_SIZE     = config['elite']
-
-            print(f'\n{"="*60}')
-            print(f'Experiência {exp_num}: mut={PROB_MUTATION}, '
-                  f'cx={PROB_CROSSOVER}, elite={ELITE_SIZE}')
-            print(f'{"="*60}')
-
-            for run in range(N_RUNS):
-                seed = SEEDS[exp_idx * N_RUNS + run]
-                random.seed(seed)
-                np.random.seed(seed)
-
-                print(f'\n  --- Run {run + 1}/{N_RUNS} (seed={seed}) ---')
-                bests = evolution()
-
-                fname = os.path.join(LOG_DIR, f'log_e{exp_num}_r{run}.txt')
-                with open(fname, 'w') as f:
-                    for b in bests:
-                        f.write(f'{b[1]}\t{SHAPE}\t{b[0]}\n')
-
-                print(f'  Saved {fname}  |  best fitness = {bests[-1][1]:.2f}')
-
-    # ================================================================
-    # MODO TEST — avalia indivíduo evoluído sem visualização
-    # ================================================================
-    elif MODE == 'test':
-
-        # Alterar para o ficheiro desejado
-        filename  = 'log_e1_r0.txt'
-        n_test_ep = TEST_EPISODES   # 100 rápido; 1000 para relatório
-
-        bests = load_bests(filename)
-        b     = bests[-1]   # última geração = melhor encontrado
-        SHAPE = b[1]
-        ind   = b[2]
-
-        total_fit, total_success = 0.0, 0
-        for i in range(n_test_ep):
-            f, s = simulate(ind, render_mode=None, seed=None)
-            total_fit     += f
-            total_success += int(s)
-
-        print(f'\n{"="*40}')
-        print(f'Ficheiro     : {filename}')
-        print(f'Episódios    : {n_test_ep}')
-        print(f'Fitness médio: {total_fit / n_test_ep:.4f}')
-        print(f'Taxa sucesso : {total_success / n_test_ep:.4f} '
-              f'({total_success}/{n_test_ep})')
-        print(f'{"="*40}')
-
-    # ================================================================
-    # MODO TEST_ALL — testa todos os logs e gera test_results.csv
-    # ================================================================
-    elif MODE == 'test_all':
-        import csv
-
-        # Pasta onde estão os logs (relativa ao local de execução)
-        LOG_DIR   = '../resultados/'   # alterar para '../resultados2/' para com vento
-        N_TEST_EP = TEST_EPISODES      # 100 rápido; usar 1000 para relatório final
-        OUT_CSV   = os.path.join(LOG_DIR, 'test_results.csv')
-
-        EXP_CONFIGS = [
-            {'mut': 0.008, 'cx': 0.5, 'elite': 0},
-            {'mut': 0.05,  'cx': 0.5, 'elite': 0},
-            {'mut': 0.008, 'cx': 0.9, 'elite': 0},
-            {'mut': 0.05,  'cx': 0.9, 'elite': 0},
-            {'mut': 0.008, 'cx': 0.5, 'elite': 1},
-            {'mut': 0.05,  'cx': 0.5, 'elite': 1},
-            {'mut': 0.008, 'cx': 0.9, 'elite': 1},
-            {'mut': 0.05,  'cx': 0.9, 'elite': 1},
-        ]
-
-        rows = []
-        for exp_idx, config in enumerate(EXP_CONFIGS):
-            exp_num = exp_idx + 1
-            print(f'\nExperiência {exp_num}: mut={config["mut"]}, '
-                  f'cx={config["cx"]}, elite={config["elite"]}')
-
-            for run in range(5):
-                fname = os.path.join(LOG_DIR, f'log_e{exp_num}_r{run}.txt')
-                if not os.path.exists(fname):
-                    print(f'  [aviso] {fname} não encontrado — a saltar.')
-                    continue
-
-                bests = load_bests(fname)
-                b = bests[-1]
-                SHAPE = b[1]
-                ind   = b[2]
-
-                total_fit, total_success = 0.0, 0
-                for _ in range(N_TEST_EP):
-                    f, s = simulate(ind, render_mode=None, seed=None)
-                    total_fit     += f
-                    total_success += int(s)
-
-                mean_fit = total_fit / N_TEST_EP
-                succ_rate = total_success / N_TEST_EP
-                print(f'  Run {run}: fitness={mean_fit:.2f}, sucesso={succ_rate:.3f}')
-                rows.append({
-                    'exp': exp_num, 'run': run,
-                    'mean_fitness': round(mean_fit, 4),
-                    'success_rate': round(succ_rate, 4),
-                })
-
-        with open(OUT_CSV, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['exp', 'run', 'mean_fitness', 'success_rate'])
-            writer.writeheader()
-            writer.writerows(rows)
-        print(f'\nResultados guardados em: {OUT_CSV}')
-
-    # ================================================================
-    # MODO EVOLVE_PHASE2 — Fase 2: comparação de 6 combinações de operadores
-    # ================================================================
-    elif MODE == 'evolve_phase2':
-
-        # ---- Configuração Vencedora da Fase 1 (atualizar após análise) ----
-        PROB_MUTATION  = 0.008   # melhor valor encontrado na Fase 1
-        PROB_CROSSOVER = 0.9     # melhor valor encontrado na Fase 1
-        ELITE_SIZE     = 1       # melhor valor encontrado na Fase 1
-
-        ENABLE_WIND   = True     # Fase 2 corre sempre com vento
-
-        P2_COMBINATIONS = [
-            {
-                'tag':    'cxUniform_mutGauss',
-                'label':  'CX Uniforme + Mut Gaussiana',
-                'cx_fn':  crossover,
-                'mut_fn': mutation,
-            },
-            {
-                'tag':    'cxUniform_mutUniform',
-                'label':  'CX Uniforme + Mut Uniforme',
-                'cx_fn':  crossover,
-                'mut_fn': mutation_uniform,
-            },
-            {
-                'tag':    'cxTwoPoint_mutGauss',
-                'label':  'CX 2 Pontos + Mut Gaussiana',
-                'cx_fn':  crossover_two_point,
-                'mut_fn': mutation,
-            },
-            {
-                'tag':    'cxTwoPoint_mutUniform',
-                'label':  'CX 2 Pontos + Mut Uniforme',
-                'cx_fn':  crossover_two_point,
-                'mut_fn': mutation_uniform,
-            },
-            {
-                'tag':    'cxArith_mutGauss',
-                'label':  'CX Aritmético + Mut Gaussiana',
-                'cx_fn':  crossover_arithmetic,
-                'mut_fn': mutation,
-            },
-            {
-                'tag':    'cxArith_mutUniform',
-                'label':  'CX Aritmético + Mut Uniforme',
-                'cx_fn':  crossover_arithmetic,
-                'mut_fn': mutation_uniform,
-            },
-        ]
-
-        LOG_DIR = './resultados_p2/'
-        os.makedirs(LOG_DIR, exist_ok=True)
-
-        N_RUNS = 5
-        # 30 seeds fixas (6 combinações × 5 runs) para reprodutibilidade
-        SEEDS_P2 = [
-            111, 222, 333, 444, 555,   # cxUniform_mutGauss
-            161, 272, 383, 494, 515,   # cxUniform_mutUniform
-            121, 232, 343, 454, 565,   # cxTwoPoint_mutGauss
-            171, 282, 393, 414, 525,   # cxTwoPoint_mutUniform
-            131, 242, 353, 464, 575,   # cxArith_mutGauss
-            181, 292, 313, 424, 535,   # cxArith_mutUniform
-        ]
-
-        print(f'\n{"="*60}')
-        print(f'FASE 2 — Comparação de Operadores Genéticos (Com Vento)')
-        print(f'Configuração vencedora: mut={PROB_MUTATION}, '
-              f'cx={PROB_CROSSOVER}, elite={ELITE_SIZE}')
-        print(f'{"="*60}')
-
-        for comb_idx, comb in enumerate(P2_COMBINATIONS):
-            print(f'\n{"="*60}')
-            print(f'Combinação {comb_idx + 1}/{len(P2_COMBINATIONS)}: {comb["label"]}')
-            print(f'{"="*60}')
-
-            for run in range(N_RUNS):
-                seed = SEEDS_P2[comb_idx * N_RUNS + run]
-                random.seed(seed)
-                np.random.seed(seed)
-
-                print(f'\n  --- Run {run + 1}/{N_RUNS} (seed={seed}) ---')
-                bests = evolution_p2(comb['cx_fn'], comb['mut_fn'])
-
-                fname = os.path.join(LOG_DIR, f'log_p2_{comb["tag"]}_r{run}.txt')
-                with open(fname, 'w') as f:
-                    for b in bests:
-                        f.write(f'{b[1]}\t{SHAPE}\t{b[0]}\n')
-
-                print(f'  Saved {fname}  |  best fitness = {bests[-1][1]:.2f}')
-
-    # ================================================================
-    # MODO VIEW — visualiza o indivíduo numa janela
-    # ================================================================
-    elif MODE == 'view':
-
-        filename = 'log_e1_r0.txt'
-
-        bests = load_bests(filename)
-        b     = bests[-1]
-        SHAPE = b[1]
-        ind   = b[2]
-
-        print(f'A visualizar {filename} (fitness={b[0]:.2f}) ...')
-        simulate(ind, render_mode='human', seed=None)
+    print(f'\n{"="*50}')
+    print(f'Fitness Médio  : {total_fit / N_TEST:.4f}')
+    print(f'Taxa de Sucesso: {total_success / N_TEST * 100:.1f}% ({total_success}/{N_TEST})')
+    print(f'{"="*50}')
